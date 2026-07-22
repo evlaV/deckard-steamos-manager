@@ -665,7 +665,9 @@ impl Manager2 {
 impl PerformanceProfile1 {
     #[zbus(property(emits_changed_signal = "const"))]
     async fn available_performance_profiles(&self) -> fdo::Result<Vec<String>> {
-        let driver = platform_profile_driver().await.map_err(to_zbus_fdo_error)?;
+        let driver = platform_profile_driver(None)
+            .await
+            .map_err(to_zbus_fdo_error)?;
         driver
             .get_available_platform_profiles()
             .await
@@ -674,7 +676,9 @@ impl PerformanceProfile1 {
 
     #[zbus(property)]
     async fn performance_profile(&self) -> fdo::Result<String> {
-        let driver = platform_profile_driver().await.map_err(to_zbus_fdo_error)?;
+        let driver = platform_profile_driver(None)
+            .await
+            .map_err(to_zbus_fdo_error)?;
         driver
             .get_platform_profile()
             .await
@@ -1563,7 +1567,7 @@ async fn create_device_interfaces(
         });
     }
 
-    if let Ok(driver) = platform_profile_driver().await
+    if let Ok(driver) = platform_profile_driver(None).await
         && !driver
             .get_available_platform_profiles()
             .await

@@ -470,7 +470,7 @@ impl SteamOSManager {
         };
         let mut driver = driver.lock().await;
         driver
-            .set_clocks(clocks)
+            .set_clock(clocks)
             .await
             .inspect_err(|message| error!("Error setting manual GPU clock: {message}"))
             .map_err(to_zbus_fdo_error)

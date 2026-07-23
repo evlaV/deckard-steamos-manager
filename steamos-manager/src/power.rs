@@ -866,9 +866,9 @@ impl PlatformProfileDriver for CustomPlatformProfileDriver {
             if let Some(driver) = &self.gpu_performance_level {
                 let mut driver = driver.lock().await;
                 if let Some(gpufreq_limit) = &profile.gpufreq_limit {
-                    driver.set_clocks_auto_with_limit(*gpufreq_limit).await?;
+                    driver.set_clocks(None, Some(*gpufreq_limit)).await?;
                 } else {
-                    driver.unset_clocks_auto_with_limit().await?;
+                    driver.set_clocks(None, None).await?;
                 }
             }
 

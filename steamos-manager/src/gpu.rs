@@ -139,6 +139,7 @@ pub(crate) struct DevfreqGpuPerformanceLevelDriver {
     available_freqs: Vec<u32>,
     level: DevfreqPerformanceLevel,
     manual_clocks: Option<u32>,
+    profile_limit: Option<u32>,
     min_freq: Option<u32>,
 }
 
@@ -663,6 +664,7 @@ impl DevfreqGpuPerformanceLevelDriver {
                 .collect(),
             level: DevfreqPerformanceLevel::Auto,
             manual_clocks: None,
+            profile_limit: None,
             min_freq,
         })
     }
@@ -681,6 +683,11 @@ impl DevfreqGpuPerformanceLevelDriver {
 
     fn max_freq(&self) -> u32 {
         *self.available_freqs.last().unwrap_or(&0u32)
+    }
+
+    fn auto_max_freq(&self) -> u32 {
+        self.profile_limit
+            .map_or(self.max_freq(), |limit| limit * 1_000_000u32)
     }
 }
 
@@ -715,7 +722,7 @@ impl GpuPerformanceLevelDriver for DevfreqGpuPerformanceLevelDriver {
                 self.manual_clocks = None;
                 self.write_value(DEVFREQ_MINIMUM_FREQ, &self.min_freq().to_string())
                     .await?;
-                self.write_value(DEVFREQ_MAXIMUM_FREQ, &self.max_freq().to_string())
+                self.write_value(DEVFREQ_MAXIMUM_FREQ, &self.auto_max_freq().to_string())
                     .await?;
             }
             DevfreqPerformanceLevel::Manual => {
@@ -745,25 +752,29 @@ impl GpuPerformanceLevelDriver for DevfreqGpuPerformanceLevelDriver {
     async fn set_clocks_auto_with_limit(&mut self, limit: u32) -> Result<()> {
         let out_min = self.min_freq();
         let out_max = limit * 1_000_000u32;
-        self.level = DevfreqPerformanceLevel::Auto;
         self.write_value(DEVFREQ_MINIMUM_FREQ, &out_min.to_string())
             .await?;
         self.write_value(DEVFREQ_MAXIMUM_FREQ, &out_max.to_string())
             .await?;
+        self.level = DevfreqPerformanceLevel::Auto;
+        self.profile_limit = Some(limit);
 
         Ok(())
     }
 
     async fn unset_clocks_auto_with_limit(&mut self) -> Result<()> {
-        if let Some(clocks) = self.manual_clocks {
+        let previous_limit = self.profile_limit.take();
+        let result = if let Some(clocks) = self.manual_clocks {
             self.level = DevfreqPerformanceLevel::Manual;
-            self.set_clocks(clocks).await?;
+            self.set_clocks(clocks).await
         } else {
             self.set_performance_level(GpuPerformanceLevel::Devfreq(DevfreqPerformanceLevel::Auto))
-                .await?;
+                .await
+        };
+        if result.is_err() {
+            self.profile_limit = previous_limit;
         }
-
-        Ok(())
+        result
     }
 
     async fn set_clocks(&mut self, clocks: u32) -> Result<()> {
@@ -799,7 +810,7 @@ pub(crate) mod test {
     use crate::hardware::test::fake_model;
     use crate::power::HWMON_PREFIX;
     use crate::{enum_roundtrip, path, testing};
-    use tokio::fs::{create_dir_all, read_to_string, write};
+    use tokio::fs::{create_dir_all, read_to_string, remove_dir, remove_file, write};
 
     pub async fn setup_amdgpu() -> Result<()> {
         // Use hwmon5 just as a test. We needed a subfolder of HWMON_PREFIX
@@ -855,12 +866,109 @@ pub(crate) mod test {
             available_freqs: vec![100_000_000, 200_000_000, 500_000_000],
             level: DevfreqPerformanceLevel::Auto,
             manual_clocks: None,
+            profile_limit: None,
             min_freq: Some(400),
         };
 
         let range = driver.get_clocks_range().await.expect("range");
         assert_eq!(range.start(), &400);
         assert_eq!(range.end(), &500);
+    }
+
+    async fn setup_devfreq() -> DevfreqGpuPerformanceLevelDriver {
+        let base = path("/sys/devices/test/gpu");
+        create_dir_all(&base).await.expect("create_dir_all");
+        write(
+            base.join(DEVFREQ_AVAILABLE_FREQ),
+            "231000000 629000000 903000000",
+        )
+        .await
+        .expect("write");
+        write(base.join(DEVFREQ_CURRENT_FREQ), "231000000")
+            .await
+            .expect("write");
+        DevfreqGpuPerformanceLevelDriver::new(base, None)
+            .await
+            .expect("driver")
+    }
+
+    async fn read_devfreq(file: &str) -> u32 {
+        read_to_string(path("/sys/devices/test/gpu").join(file))
+            .await
+            .expect("read")
+            .trim()
+            .parse()
+            .expect("parse")
+    }
+
+    #[tokio::test]
+    async fn devfreq_auto_level_keeps_profile_limit() {
+        let _h = testing::start();
+        let mut driver = setup_devfreq().await;
+
+        driver.set_clocks_auto_with_limit(629).await.expect("limit");
+        assert_eq!(read_devfreq(DEVFREQ_MAXIMUM_FREQ).await, 629_000_000);
+
+        driver
+            .set_performance_level(GpuPerformanceLevel::Devfreq(DevfreqPerformanceLevel::Auto))
+            .await
+            .expect("auto");
+        assert_eq!(read_devfreq(DEVFREQ_MINIMUM_FREQ).await, 231_000_000);
+        assert_eq!(read_devfreq(DEVFREQ_MAXIMUM_FREQ).await, 629_000_000);
+    }
+
+    #[tokio::test]
+    async fn devfreq_unset_profile_limit_restores_full_range() {
+        let _h = testing::start();
+        let mut driver = setup_devfreq().await;
+
+        driver.set_clocks_auto_with_limit(629).await.expect("limit");
+        driver.unset_clocks_auto_with_limit().await.expect("unset");
+        assert_eq!(read_devfreq(DEVFREQ_MAXIMUM_FREQ).await, 903_000_000);
+
+        driver
+            .set_performance_level(GpuPerformanceLevel::Devfreq(DevfreqPerformanceLevel::Auto))
+            .await
+            .expect("auto");
+        assert_eq!(read_devfreq(DEVFREQ_MAXIMUM_FREQ).await, 903_000_000);
+    }
+
+    #[tokio::test]
+    async fn devfreq_failed_profile_limit_is_not_retained() {
+        let _h = testing::start();
+        let mut driver = setup_devfreq().await;
+        let max_freq = path("/sys/devices/test/gpu").join(DEVFREQ_MAXIMUM_FREQ);
+
+        // A directory in place of the sysfs node makes the write fail
+        create_dir_all(&max_freq).await.expect("create_dir_all");
+        assert!(driver.set_clocks_auto_with_limit(629).await.is_err());
+        remove_dir(&max_freq).await.expect("remove_dir");
+
+        driver
+            .set_performance_level(GpuPerformanceLevel::Devfreq(DevfreqPerformanceLevel::Auto))
+            .await
+            .expect("auto");
+        assert_eq!(read_devfreq(DEVFREQ_MAXIMUM_FREQ).await, 903_000_000);
+    }
+
+    #[tokio::test]
+    async fn devfreq_failed_profile_limit_unset_keeps_limit() {
+        let _h = testing::start();
+        let mut driver = setup_devfreq().await;
+        let max_freq = path("/sys/devices/test/gpu").join(DEVFREQ_MAXIMUM_FREQ);
+
+        driver.set_clocks_auto_with_limit(629).await.expect("limit");
+
+        remove_file(&max_freq).await.expect("remove_file");
+        create_dir_all(&max_freq).await.expect("create_dir_all");
+        assert!(driver.unset_clocks_auto_with_limit().await.is_err());
+        remove_dir(&max_freq).await.expect("remove_dir");
+
+        driver
+            .set_performance_level(GpuPerformanceLevel::Devfreq(DevfreqPerformanceLevel::Auto))
+            .await
+            .expect("auto");
+        assert_eq!(read_devfreq(DEVFREQ_MAXIMUM_FREQ).await, 629_000_000);
     }
 
     pub async fn create_nodes() -> Result<()> {
